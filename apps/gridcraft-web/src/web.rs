@@ -41,6 +41,10 @@ pub fn start() {
         // workbooks in it and stores what it saves (`host`).
         let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
         let app_bridge = bridge.clone();
+        // Copies of unsaved workbooks a closed or crashed tab left, read before the app is built.
+        // In host mode the parent page owns the files, so nothing is kept or reopened.
+        let mut startup = if bridge.is_none() { Some(crate::recovery::open().await) } else { None };
+        let downloaded = std::rc::Rc::new(std::cell::Cell::new(false));
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
@@ -55,7 +59,7 @@ pub fn start() {
                     } else if q.contains("sample") {
                         let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
                     }
-                    let mut services = services(inbox.clone(), cc.egui_ctx.clone());
+                    let mut services = services(inbox.clone(), cc.egui_ctx.clone(), downloaded.clone());
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
                     }
@@ -96,7 +100,21 @@ pub fn start() {
                         }
                         bridge.post_ready();
                     }
-                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs }))
+                    let mut recovery = None;
+                    if let Some(st) = startup.take() {
+                        let mut adopted = None;
+                        if !q.contains("sample")
+                            && let Some((uid, key, message)) = crate::recovery::restore(&mut app, &st.recovered)
+                        {
+                            adopted = Some((uid, key));
+                            app.notice = Some(gridcraft_ui_egui::Notice { text: message, kind: gridcraft_ui_egui::NoticeKind::Info, action: None });
+                        }
+                        for w in &st.warnings {
+                            log::warn!("crash recovery: {w}");
+                        }
+                        recovery = Some(crate::recovery::WebRecovery::new(st.store, adopted, downloaded.clone(), &cc.egui_ctx));
+                    }
+                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs, recovery }))
                 }),
             )
             .await;
@@ -125,6 +143,7 @@ struct WebShell {
     inbox: Inbox,
     bridge: Option<crate::host::Bridge>,
     prefs: crate::prefs::PrefsSync,
+    recovery: Option<crate::recovery::WebRecovery>,
 }
 
 fn local_storage() -> Option<web_sys::Storage> {
@@ -168,6 +187,9 @@ impl eframe::App for WebShell {
                 None => log::warn!("preferences: browser storage is unavailable"),
             }
         }
+        if let Some(recovery) = &mut self.recovery {
+            recovery.tick(&self.app, ctx);
+        }
     }
 
     /// Forwards a browser frame's raw input to the shared app before eframe handles it.
@@ -183,7 +205,7 @@ impl eframe::App for WebShell {
     }
 }
 
-fn services(inbox: Inbox, ctx: egui::Context) -> Services {
+fn services(inbox: Inbox, ctx: egui::Context, downloaded: std::rc::Rc<std::cell::Cell<bool>>) -> Services {
     let open_inbox = inbox.clone();
     let picture_ctx = ctx.clone();
     Services {
@@ -215,7 +237,11 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 ctx.request_repaint();
             });
         })),
-        download: Some(Box::new(|name: &str, bytes: &[u8]| {
+        download: Some(Box::new(move |name: &str, bytes: &[u8]| {
+            // A workbook download is the web's Save: the unsaved-changes copy is no longer needed.
+            if matches!(name.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(), Some("xlsx" | "xlsm")) {
+                downloaded.set(true);
+            }
             if let Err(e) = download(name, bytes) {
                 log::error!("download of {name} failed: {e}");
             }
